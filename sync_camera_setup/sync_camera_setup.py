@@ -149,7 +149,7 @@ def get_camera_name(device_path: str) -> str:
 def discover_cameras_linux() -> List[CameraInfo]:
     """Discover cameras on Linux using v4l2."""
     cameras = []
-    seen_names = {}
+    name_counts = {}  # Track how many cameras have each name
     
     try:
         video_devices = sorted(Path('/dev').glob('video*'), 
@@ -168,14 +168,19 @@ def discover_cameras_linux() -> List[CameraInfo]:
             
             name = get_camera_name(device_path)
             
-            if name in seen_names:
-                continue
-            seen_names[name] = idx
-            
-            if not should_filter_camera(name):
-                cameras.append(CameraInfo(index=idx, name=name, path=device_path))
-            else:
+            if should_filter_camera(name):
                 print(f"  Filtered out: {name} ({device_path})")
+                continue
+            
+            # Handle duplicate names by appending index
+            if name in name_counts:
+                name_counts[name] += 1
+                display_name = f"{name} #{name_counts[name]}"
+            else:
+                name_counts[name] = 1
+                display_name = name
+            
+            cameras.append(CameraInfo(index=idx, name=display_name, path=device_path))
                 
     except Exception as e:
         print(f"Error discovering cameras: {e}")
