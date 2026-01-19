@@ -1,0 +1,7 @@
+opencv-contrib-python>=4.8.0
+numpy>=1.24.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# Optional: Better QR detection (install separately with: pip install zxing-cpp)
+# zxing-cpp>=2.0.0
