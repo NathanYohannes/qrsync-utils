@@ -11,5 +11,10 @@ fi
 
 source venv/bin/activate
 
-# Pass all arguments to the script
-python sync_camera_setup.py "$@"
+PORT="${1:-5001}"
+
+echo "📷 Starting Sync Camera Setup"
+echo "   Open: http://localhost:$PORT"
+echo ""
+
+python sync_camera_setup.py --port "$PORT"
