@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Sync Camera Setup - Live camera preview with QR code detection.
-Opens all USB cameras (filtering out atlas/user-facing cameras) using ffplay
-and runs QR detection in parallel.
+Opens USB cameras (filtering out atlas/user-facing cameras) and displays
+live feeds with real-time QR timestamp detection.
 
-Use this to verify cameras can see and decode the QR beacon before recording.
+Two modes:
+  - Default: OpenCV windows with QR detection overlay
+  - --ffplay: Uses ffplay for display (no QR detection, but more compatible)
 """
 
 import argparse
@@ -15,7 +17,7 @@ import time
 import threading
 import signal
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass
 
 import cv2
@@ -112,52 +114,76 @@ def should_filter_camera(name: str) -> bool:
     return False
 
 
+def is_capture_device(device_path: str) -> bool:
+    """Check if a v4l2 device is a video capture device (not metadata)."""
+    try:
+        result = subprocess.run(
+            ['v4l2-ctl', '-d', device_path, '--list-formats-ext'],
+            capture_output=True, text=True, timeout=5
+        )
+        output = result.stdout
+        # Check for actual video formats
+        if 'MJPG' in output or 'YUYV' in output or 'NV12' in output or 'H264' in output:
+            return True
+        return False
+    except Exception:
+        # If we can't check, assume it might be valid
+        return True
+
+
+def get_camera_name(device_path: str) -> str:
+    """Get camera name using v4l2-ctl."""
+    try:
+        result = subprocess.run(
+            ['v4l2-ctl', '-d', device_path, '--info'],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.split('\n'):
+            if 'Card type' in line:
+                return line.split(':', 1)[1].strip()
+    except Exception:
+        pass
+    return "Unknown Camera"
+
+
 def discover_cameras_linux() -> List[CameraInfo]:
     """Discover cameras on Linux using v4l2."""
     cameras = []
+    seen_names = {}  # Track cameras by name to avoid duplicates
+    
     try:
-        video_devices = sorted(Path('/dev').glob('video*'))
+        video_devices = sorted(Path('/dev').glob('video*'), 
+                               key=lambda p: int(p.name.replace('video', '')) if p.name.replace('video', '').isdigit() else 999)
+        
         for device in video_devices:
             try:
                 idx = int(device.name.replace('video', ''))
             except ValueError:
                 continue
             
-            name = f'Camera {idx}'
+            device_path = str(device)
             
-            # Try to get device name using v4l2-ctl
-            try:
-                result = subprocess.run(
-                    ['v4l2-ctl', '-d', str(device), '--info'],
-                    capture_output=True, text=True, timeout=5
-                )
-                for line in result.stdout.split('\n'):
-                    if 'Card type' in line:
-                        name = line.split(':', 1)[1].strip()
-                        break
-            except Exception:
-                pass
+            # Check if it's actually a capture device
+            if not is_capture_device(device_path):
+                continue
             
-            # Check if it's a capture device (not metadata/output)
-            try:
-                result = subprocess.run(
-                    ['v4l2-ctl', '-d', str(device), '--list-formats-ext'],
-                    capture_output=True, text=True, timeout=5
-                )
-                # Skip if no video capture formats
-                if 'Video Capture' not in result.stdout and 'MJPG' not in result.stdout and 'YUYV' not in result.stdout:
-                    continue
-            except Exception:
-                pass
+            name = get_camera_name(device_path)
+            
+            # Skip if we already have a camera with this name (avoid duplicates)
+            # Keep the lower-numbered device
+            if name in seen_names:
+                continue
+            seen_names[name] = idx
             
             if not should_filter_camera(name):
                 cameras.append(CameraInfo(
                     index=idx,
                     name=name,
-                    path=str(device)
+                    path=device_path
                 ))
             else:
-                print(f"  Filtered out: {name} ({device})")
+                print(f"  Filtered out: {name} ({device_path})")
+                
     except Exception as e:
         print(f"Error discovering cameras: {e}")
     
@@ -167,11 +193,9 @@ def discover_cameras_linux() -> List[CameraInfo]:
 def discover_cameras_macos() -> List[CameraInfo]:
     """Discover cameras on macOS."""
     cameras = []
-    # On macOS, just probe indices
     for idx in range(10):
         cap = cv2.VideoCapture(idx)
         if cap.isOpened():
-            # Try to get name via system_profiler
             name = f'Camera {idx}'
             cameras.append(CameraInfo(
                 index=idx,
@@ -190,10 +214,11 @@ def discover_cameras() -> List[CameraInfo]:
         return discover_cameras_linux()
 
 
-def launch_ffplay(camera: CameraInfo, window_title: str) -> subprocess.Popen:
+def launch_ffplay(camera: CameraInfo) -> subprocess.Popen:
     """Launch ffplay for a camera."""
+    window_title = f"Camera {camera.index}: {camera.name}"
+    
     if sys.platform == 'darwin':
-        # macOS uses avfoundation
         cmd = [
             'ffplay',
             '-f', 'avfoundation',
@@ -204,7 +229,6 @@ def launch_ffplay(camera: CameraInfo, window_title: str) -> subprocess.Popen:
             '-loglevel', 'error',
         ]
     else:
-        # Linux uses v4l2
         cmd = [
             'ffplay',
             '-f', 'v4l2',
@@ -215,52 +239,156 @@ def launch_ffplay(camera: CameraInfo, window_title: str) -> subprocess.Popen:
             '-loglevel', 'error',
         ]
     
-    print(f"  Launching: {' '.join(cmd)}")
+    print(f"  {camera.name}: ffplay {camera.path}")
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
-def qr_detection_loop(camera: CameraInfo, detector: QRDetector, stop_event: threading.Event, status: Dict):
-    """Run QR detection in background for a camera."""
-    cap = cv2.VideoCapture(camera.path if sys.platform != 'darwin' else camera.index)
+def run_ffplay_mode(cameras: List[CameraInfo]):
+    """Run in ffplay-only mode (no QR detection)."""
+    print("\nLaunching ffplay windows...")
+    print("  (QR detection disabled in ffplay mode)\n")
     
-    if not cap.isOpened():
-        print(f"  Warning: Could not open {camera.path} for QR detection")
+    processes = []
+    for cam in cameras:
+        proc = launch_ffplay(cam)
+        processes.append(proc)
+    
+    print("\nPress Ctrl+C to stop, or close all windows.\n")
+    
+    def signal_handler(sig, frame):
+        print("\nShutting down...")
+        for proc in processes:
+            proc.terminate()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Wait for processes
+    try:
+        while True:
+            if all(proc.poll() is not None for proc in processes):
+                print("All windows closed.")
+                break
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    
+    for proc in processes:
+        proc.terminate()
+
+
+def run_opencv_mode(cameras: List[CameraInfo]):
+    """Run with OpenCV windows and QR detection."""
+    print("\nOpening cameras with QR detection...")
+    
+    detector = QRDetector()
+    caps: Dict[int, cv2.VideoCapture] = {}
+    qr_status: Dict[int, Tuple[Optional[str], float]] = {}  # cam_idx -> (qr_data, timestamp)
+    
+    # Open all cameras
+    for cam in cameras:
+        if sys.platform == 'darwin':
+            cap = cv2.VideoCapture(cam.index)
+        else:
+            cap = cv2.VideoCapture(cam.path)
+        
+        if cap.isOpened():
+            # Try to set resolution
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce latency
+            caps[cam.index] = cap
+            qr_status[cam.index] = (None, 0)
+            print(f"  Opened: {cam.name} ({cam.path})")
+        else:
+            print(f"  Failed to open: {cam.name} ({cam.path})")
+    
+    if not caps:
+        print("\nNo cameras could be opened!")
         return
     
-    # Set resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    print(f"\n{len(caps)} camera(s) active. Press 'q' to quit.\n")
+    print("=" * 50)
+    print("  QR Detection Status")
+    print("=" * 50)
     
-    last_qr = None
-    last_print_time = 0
+    running = True
     
-    while not stop_event.is_set():
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            qr_data = detector.detect(frame)
-            status[camera.index] = qr_data
+    def signal_handler(sig, frame):
+        nonlocal running
+        running = False
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    last_status: Dict[int, Optional[str]] = {}
+    
+    while running:
+        for cam in cameras:
+            if cam.index not in caps:
+                continue
             
-            # Print when QR changes or periodically
+            cap = caps[cam.index]
+            ret, frame = cap.read()
+            
+            if not ret or frame is None:
+                continue
+            
+            # Detect QR
+            qr_data = detector.detect(frame)
             now = time.time()
-            if qr_data != last_qr or (qr_data and now - last_print_time > 1.0):
+            qr_status[cam.index] = (qr_data, now)
+            
+            # Print status changes
+            if qr_data != last_status.get(cam.index):
                 if qr_data:
-                    print(f"\033[92m  [{camera.name}] QR: {qr_data}\033[0m")
-                elif last_qr:
-                    print(f"\033[91m  [{camera.name}] QR: Lost\033[0m")
-                last_qr = qr_data
-                last_print_time = now
+                    print(f"\033[92m  [Cam {cam.index}] QR: {qr_data}\033[0m")
+                elif last_status.get(cam.index):
+                    print(f"\033[91m  [Cam {cam.index}] QR: Lost\033[0m")
+                last_status[cam.index] = qr_data
+            
+            # Draw overlay on frame
+            h, w = frame.shape[:2]
+            
+            # Camera label
+            cv2.putText(frame, f"Camera {cam.index}", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
+            # QR status
+            if qr_data:
+                color = (0, 255, 0)  # Green
+                text = f"QR: {qr_data}"
+            else:
+                color = (0, 0, 255)  # Red
+                text = "QR: Not detected"
+            
+            cv2.putText(frame, text, (10, h - 20), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            
+            # Status indicator circle
+            cv2.circle(frame, (w - 30, 30), 15, color, -1)
+            
+            # Show frame
+            window_name = f"Camera {cam.index}: {cam.name}"
+            cv2.imshow(window_name, frame)
         
-        # Don't spin too fast
-        time.sleep(0.05)
+        # Check for quit
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == 27:  # q or ESC
+            running = False
+        
+        # Check if all windows were closed
+        if cv2.getWindowProperty(list(caps.keys())[0] if caps else 0, cv2.WND_PROP_VISIBLE) < 1:
+            # Window was closed
+            pass
     
-    cap.release()
-
-
-def print_status_header():
-    """Print the status header."""
-    print("\n" + "=" * 60)
-    print("  QR Detection Status (Ctrl+C to stop)")
-    print("=" * 60)
+    # Cleanup
+    print("\nShutting down...")
+    for cap in caps.values():
+        cap.release()
+    cv2.destroyAllWindows()
+    print("Done.")
 
 
 def main():
@@ -268,22 +396,20 @@ def main():
         description='Sync Camera Setup - Live camera preview with QR detection',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-This tool helps you set up cameras for QR-based sync calibration.
+Modes:
+  Default    OpenCV windows with QR detection overlay
+  --ffplay   Use ffplay for display (more compatible, but no QR detection)
 
-It will:
-  1. Discover USB cameras (filtering out atlas, FaceTime, virtual cameras)
-  2. Launch ffplay windows for each camera
-  3. Run QR detection and print results to console
-
-Usage:
-  1. Start the QR beacon on another device/screen
-  2. Run this tool to see live camera feeds
-  3. Adjust cameras until QR codes are detected (green text)
-  4. Start your recording when all cameras show QR values
+Examples:
+  %(prog)s                    # OpenCV mode with QR detection
+  %(prog)s --ffplay           # ffplay mode (no QR)
+  %(prog)s --cameras 0,2      # Only use cameras 0 and 2
         """
     )
-    parser.add_argument('--no-qr', action='store_true', help='Disable QR detection (just show video)')
-    parser.add_argument('--cameras', type=str, help='Comma-separated camera indices to use (e.g., "0,2")')
+    parser.add_argument('--ffplay', action='store_true', 
+                        help='Use ffplay for display (no QR detection)')
+    parser.add_argument('--cameras', type=str, 
+                        help='Comma-separated camera indices to use (e.g., "0,2")')
     
     args = parser.parse_args()
     
@@ -296,79 +422,25 @@ Usage:
     print("\nDiscovering cameras...")
     cameras = discover_cameras()
     
-    # Filter by user selection if provided
+    # Filter by user selection
     if args.cameras:
-        selected_indices = [int(x.strip()) for x in args.cameras.split(',')]
-        cameras = [c for c in cameras if c.index in selected_indices]
+        selected = [int(x.strip()) for x in args.cameras.split(',')]
+        cameras = [c for c in cameras if c.index in selected]
     
     if not cameras:
         print("\nNo cameras found!")
-        print("Make sure cameras are connected and not in use by another application.")
+        print("Make sure cameras are connected and not in use.")
         sys.exit(1)
     
     print(f"\nFound {len(cameras)} camera(s):")
     for cam in cameras:
-        print(f"  - {cam.name} ({cam.path})")
+        print(f"  - [{cam.index}] {cam.name} ({cam.path})")
     
-    # Launch ffplay for each camera
-    print("\nLaunching video windows...")
-    ffplay_processes = []
-    for cam in cameras:
-        title = f"Camera {cam.index}: {cam.name}"
-        proc = launch_ffplay(cam, title)
-        ffplay_processes.append(proc)
-    
-    # Setup QR detection threads
-    stop_event = threading.Event()
-    qr_threads = []
-    qr_status: Dict[int, Optional[str]] = {}
-    
-    if not args.no_qr:
-        print("\nStarting QR detection...")
-        detector = QRDetector()
-        
-        for cam in cameras:
-            thread = threading.Thread(
-                target=qr_detection_loop,
-                args=(cam, detector, stop_event, qr_status),
-                daemon=True
-            )
-            thread.start()
-            qr_threads.append(thread)
-        
-        print_status_header()
+    # Run appropriate mode
+    if args.ffplay:
+        run_ffplay_mode(cameras)
     else:
-        print("\nQR detection disabled. Press Ctrl+C to stop.")
-    
-    # Handle Ctrl+C gracefully
-    def signal_handler(sig, frame):
-        print("\n\nShutting down...")
-        stop_event.set()
-        for proc in ffplay_processes:
-            proc.terminate()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Wait for ffplay processes to exit
-    try:
-        while True:
-            # Check if all ffplay processes have exited
-            all_exited = all(proc.poll() is not None for proc in ffplay_processes)
-            if all_exited:
-                print("\nAll video windows closed.")
-                break
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        pass
-    
-    # Cleanup
-    stop_event.set()
-    for proc in ffplay_processes:
-        proc.terminate()
-    
-    print("Done.")
+        run_opencv_mode(cameras)
 
 
 if __name__ == '__main__':
