@@ -308,6 +308,7 @@ class CameraManager:
 
 # Global
 manager: Optional[CameraManager] = None
+selected_camera_indices: Optional[List[int]] = None
 
 
 HTML_PAGE = '''
@@ -605,7 +606,7 @@ HTML_PAGE = '''
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global manager
+    global manager, selected_camera_indices
     
     print("\nDiscovering cameras...")
     cameras = discover_cameras()
@@ -615,13 +616,25 @@ async def lifespan(app: FastAPI):
         for c in cameras:
             print(f"  - [{c.index}] {c.name}")
         
-        print("\nOpening cameras...")
-        manager = CameraManager()
-        opened = manager.open_cameras(cameras)
+        # Filter cameras based on selected indices
+        if selected_camera_indices is not None:
+            cameras_to_open = [c for c in cameras if c.index in selected_camera_indices]
+            if len(cameras_to_open) < len(selected_camera_indices):
+                found_indices = {c.index for c in cameras_to_open}
+                missing = set(selected_camera_indices) - found_indices
+                print(f"\nWarning: Camera indices {missing} not found or filtered out.")
+            cameras = cameras_to_open
         
-        if opened > 0:
-            print(f"\nStarting capture ({opened} cameras)...")
-            manager.start()
+        if cameras:
+            print(f"\nOpening {len(cameras)} camera(s)...")
+            manager = CameraManager()
+            opened = manager.open_cameras(cameras)
+            
+            if opened > 0:
+                print(f"\nStarting capture ({opened} cameras)...")
+                manager.start()
+        else:
+            print("\nNo cameras to open after filtering!")
     else:
         print("\nNo cameras found!")
     
@@ -673,13 +686,41 @@ def main():
     )
     parser.add_argument('--port', type=int, default=5001, help='Port (default: 5001)')
     parser.add_argument('--host', default='0.0.0.0', help='Host (default: 0.0.0.0)')
+    parser.add_argument('--cameras', type=int, nargs='+', metavar='INDEX',
+                        help='Camera indices to display (e.g., --cameras 0 2). If not specified, all cameras are shown.')
+    parser.add_argument('--list', action='store_true',
+                        help='List available cameras and exit')
     
     args = parser.parse_args()
+    
+    # Handle --list option
+    if args.list:
+        print("\nDiscovering cameras...")
+        cameras = discover_cameras()
+        if cameras:
+            print(f"\nFound {len(cameras)} camera(s):\n")
+            for c in cameras:
+                print(f"  [{c.index}] {c.name}")
+                print(f"       Path: {c.path}")
+            print("\nTo use specific cameras, run with:")
+            indices = ' '.join(str(c.index) for c in cameras)
+            print(f"  python sync_camera_setup.py --cameras {indices}")
+        else:
+            print("\nNo cameras found!")
+        return
+    
+    # Set global camera selection
+    global selected_camera_indices
+    selected_camera_indices = args.cameras
     
     print("=" * 60)
     print("  SYNC CAMERA SETUP")
     print("  Web-based camera preview with QR detection")
     print("=" * 60)
+    if args.cameras:
+        print(f"  Camera filter: {args.cameras}")
+    else:
+        print(f"  Using all available cameras")
     print(f"\n  Open: http://localhost:{args.port}")
     print(f"  Network: http://0.0.0.0:{args.port}")
     print("\n  Press Ctrl+C to stop\n")
