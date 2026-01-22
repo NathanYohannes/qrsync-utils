@@ -2648,6 +2648,93 @@ analysis_state = {
 }
 
 
+def save_analysis_results(results: dict, output_dir: Path):
+    """Save analysis results to CSV and JSON files."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Save CSV with all data points
+    csv_path = output_dir / f"sync_analysis_{timestamp}.csv"
+    try:
+        lines = ["frame,time_seconds,time_minutes,qr_offset_ms,pts_offset_ms,sync_error_ms"]
+        fps = results.get('fps', 30)
+        
+        frames = results.get('frames', [])
+        qr_offsets = results.get('qr_offsets', [])
+        pts_offsets = results.get('pts_offsets', [])
+        sync_errors = results.get('sync_errors', [])
+        
+        for i, frame in enumerate(frames):
+            time_sec = frame / fps
+            time_min = time_sec / 60
+            qr_off = qr_offsets[i] if i < len(qr_offsets) and qr_offsets[i] is not None else ''
+            pts_off = pts_offsets[i] if i < len(pts_offsets) and pts_offsets[i] is not None else ''
+            sync_err = sync_errors[i] if i < len(sync_errors) and sync_errors[i] is not None else ''
+            
+            if qr_off != '':
+                qr_off = f"{qr_off:.3f}"
+            if pts_off != '':
+                pts_off = f"{pts_off:.3f}"
+            if sync_err != '':
+                sync_err = f"{sync_err:.3f}"
+            
+            lines.append(f"{frame},{time_sec:.3f},{time_min:.4f},{qr_off},{pts_off},{sync_err}")
+        
+        with open(csv_path, 'w') as f:
+            f.write('\n'.join(lines))
+        print(f"Saved analysis CSV: {csv_path}")
+    except Exception as e:
+        print(f"Error saving CSV: {e}")
+    
+    # Save JSON with statistics
+    json_path = output_dir / f"sync_analysis_{timestamp}.json"
+    try:
+        import numpy as np
+        
+        # Calculate statistics
+        qr_offsets_valid = [x for x in results.get('qr_offsets', []) if x is not None]
+        pts_offsets_valid = [x for x in results.get('pts_offsets', []) if x is not None]
+        sync_errors_valid = [x for x in results.get('sync_errors', []) if x is not None]
+        
+        def calc_stats(data):
+            if not data:
+                return None
+            arr = np.array(data)
+            return {
+                'count': len(arr),
+                'mean': float(np.mean(arr)),
+                'std': float(np.std(arr)),
+                'min': float(np.min(arr)),
+                'max': float(np.max(arr)),
+                'median': float(np.median(arr)),
+                'p5': float(np.percentile(arr, 5)),
+                'p95': float(np.percentile(arr, 95)),
+            }
+        
+        stats = {
+            'timestamp': timestamp,
+            'video1_name': results.get('video1_name'),
+            'video2_name': results.get('video2_name'),
+            'sample_count': results.get('sample_count', 0),
+            'sample_interval': results.get('sample_interval'),
+            'max_frames': results.get('max_frames'),
+            'fps': results.get('fps'),
+            'qr_detections': results.get('qr_detections', {}),
+            'statistics': {
+                'qr_offsets': calc_stats(qr_offsets_valid),
+                'pts_offsets': calc_stats(pts_offsets_valid),
+                'sync_errors': calc_stats(sync_errors_valid),
+            }
+        }
+        
+        with open(json_path, 'w') as f:
+            json.dump(stats, f, indent=2)
+        print(f"Saved analysis stats: {json_path}")
+    except Exception as e:
+        print(f"Error saving JSON: {e}")
+    
+    return csv_path, json_path
+
+
 def run_analysis_thread(sample_interval: int, fast_mode: bool = True):
     """Run analysis in background thread."""
     global analysis_state
@@ -2664,6 +2751,14 @@ def run_analysis_thread(sample_interval: int, fast_mode: bool = True):
         results = viewer.analyze_sync(sample_interval=sample_interval, progress_callback=progress_cb, fast_mode=fast_mode)
         
         analysis_state['results'] = results
+        analysis_state['status'] = 'Saving results...'
+        
+        # Auto-save results to video directory
+        video_dir = Path(viewer.video1_path).parent
+        csv_path, json_path = save_analysis_results(results, video_dir)
+        analysis_state['csv_path'] = str(csv_path)
+        analysis_state['json_path'] = str(json_path)
+        
         analysis_state['status'] = 'Complete!'
         analysis_state['error'] = None
     except Exception as e:
@@ -2812,6 +2907,8 @@ async def get_analysis_status():
         'operation': analysis_state.get('operation'),
         'has_results': analysis_state['results'] is not None,
         'has_video': analysis_state['video_path'] is not None,
+        'csv_path': analysis_state.get('csv_path'),
+        'json_path': analysis_state.get('json_path'),
         'error': analysis_state.get('error'),
     })
 
