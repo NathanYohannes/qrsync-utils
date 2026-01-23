@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import uvicorn
 
@@ -114,6 +114,124 @@ def should_filter_camera(name: str) -> bool:
         if re.search(pattern, name_lower):
             return True
     return False
+
+
+def get_camera_controls(device_path: str) -> Dict:
+    """Get all v4l2 controls for a camera device."""
+    if sys.platform == 'darwin':
+        return {}  # v4l2 not available on macOS
+    
+    try:
+        result = subprocess.run(
+            ['v4l2-ctl', '-d', device_path, '--list-ctrls-menus'],
+            capture_output=True, text=True, timeout=5
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    
+    controls = {}
+    lines = result.stdout.split('\n')
+    current_control = None
+    
+    for line in lines:
+        ctrl_match = re.match(
+            r'\s*(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)',
+            line
+        )
+        
+        if ctrl_match:
+            name = ctrl_match.group(1)
+            ctrl_type = ctrl_match.group(2)
+            params_str = ctrl_match.group(3)
+            
+            control = {'type': ctrl_type, 'name': name}
+            
+            if ctrl_type == 'int':
+                for param in ['min', 'max', 'step', 'default', 'value']:
+                    match = re.search(rf'{param}=(-?\d+)', params_str)
+                    if match:
+                        control[param] = int(match.group(1))
+            elif ctrl_type == 'bool':
+                match = re.search(r'default=(\d+)', params_str)
+                if match:
+                    control['default'] = int(match.group(1))
+                match = re.search(r'value=(\d+)', params_str)
+                if match:
+                    control['value'] = int(match.group(1))
+                control['options'] = {0: 'Off', 1: 'On'}
+            elif ctrl_type == 'menu':
+                match = re.search(r'default=(\d+)', params_str)
+                if match:
+                    control['default'] = int(match.group(1))
+                match = re.search(r'value=(\d+)', params_str)
+                if match:
+                    control['value'] = int(match.group(1))
+                control['options'] = {}
+                current_control = name
+                controls[name] = control
+                continue
+            
+            controls[name] = control
+            current_control = name if ctrl_type == 'menu' else None
+        
+        elif current_control and line.strip():
+            menu_match = re.match(r'\s+(\d+):\s+(.+)', line)
+            if menu_match:
+                idx = int(menu_match.group(1))
+                label = menu_match.group(2).strip()
+                controls[current_control]['options'][idx] = label
+    
+    return controls
+
+
+def set_camera_control(device_path: str, control: str, value: int) -> Tuple[bool, str]:
+    """Set a v4l2 control value for a camera."""
+    if sys.platform == 'darwin':
+        return False, "v4l2 not available on macOS"
+    
+    try:
+        result = subprocess.run(
+            ['v4l2-ctl', '-d', device_path, '-c', f'{control}={value}'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return False, result.stderr.strip()
+        return True, ""
+    except FileNotFoundError:
+        return False, "v4l2-ctl not found"
+    except subprocess.TimeoutExpired:
+        return False, "Command timed out"
+    except Exception as e:
+        return False, str(e)
+
+
+def reset_camera_controls(device_path: str) -> Tuple[bool, str]:
+    """Reset all camera controls to their default values."""
+    if sys.platform == 'darwin':
+        return False, "v4l2 not available on macOS"
+    
+    try:
+        controls = get_camera_controls(device_path)
+        cmd = ['v4l2-ctl', '-d', device_path]
+        
+        for name, ctrl in controls.items():
+            if 'default' in ctrl:
+                cmd.extend(['-c', f'{name}={ctrl["default"]}'])
+        
+        if len(cmd) <= 3:
+            return True, "No controls to reset"
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        
+        if result.returncode != 0:
+            return False, result.stderr.strip()
+        return True, ""
+    except FileNotFoundError:
+        return False, "v4l2-ctl not found"
+    except subprocess.TimeoutExpired:
+        return False, "Command timed out"
+    except Exception as e:
+        return False, str(e)
 
 
 def is_capture_device(device_path: str) -> bool:
@@ -451,6 +569,218 @@ HTML_PAGE = '''
             display: block;
         }
         
+        /* V4L2 Settings Panel Styles */
+        .settings-toggle {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 18px;
+            background: var(--bg-tertiary);
+            cursor: pointer;
+            border-top: 1px solid var(--border);
+            user-select: none;
+            transition: background 0.2s;
+        }
+        
+        .settings-toggle:hover {
+            background: rgba(0, 212, 255, 0.1);
+        }
+        
+        .settings-toggle-text {
+            font-size: 0.9rem;
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .settings-toggle-arrow {
+            font-size: 0.8rem;
+            transition: transform 0.3s;
+            color: var(--text-secondary);
+        }
+        
+        .settings-toggle.open .settings-toggle-arrow {
+            transform: rotate(180deg);
+        }
+        
+        .settings-panel {
+            max-height: 0;
+            overflow: hidden;
+            background: var(--bg-primary);
+            transition: max-height 0.3s ease-out;
+        }
+        
+        .settings-panel.open {
+            max-height: 600px;
+            overflow-y: auto;
+        }
+        
+        .settings-content {
+            padding: 16px 18px;
+        }
+        
+        .settings-loading {
+            text-align: center;
+            padding: 20px;
+            color: var(--text-secondary);
+        }
+        
+        .settings-unavailable {
+            text-align: center;
+            padding: 20px;
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+        
+        .control-group {
+            margin-bottom: 14px;
+        }
+        
+        .control-label {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+        
+        .control-name {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+        
+        .control-value {
+            font-family: 'JetBrains Mono', monospace;
+            background: rgba(0, 212, 255, 0.2);
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            color: var(--accent);
+            min-width: 50px;
+            text-align: center;
+        }
+        
+        .slider-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .range-label {
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            min-width: 40px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .range-label.max {
+            text-align: right;
+        }
+        
+        input[type="range"] {
+            flex: 1;
+            height: 6px;
+            -webkit-appearance: none;
+            appearance: none;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 3px;
+            outline: none;
+        }
+        
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            background: linear-gradient(135deg, #00d4ff, #0099cc);
+            border-radius: 50%;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0, 212, 255, 0.4);
+            transition: transform 0.2s;
+        }
+        
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.15);
+        }
+        
+        select.control-select {
+            width: 100%;
+            padding: 8px 10px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 6px;
+            color: #fff;
+            font-size: 0.85rem;
+            cursor: pointer;
+            outline: none;
+        }
+        
+        select.control-select:focus {
+            border-color: var(--accent);
+        }
+        
+        select.control-select option {
+            background: var(--bg-primary);
+            color: #fff;
+        }
+        
+        .settings-btn-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 16px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border);
+        }
+        
+        .settings-btn {
+            flex: 1;
+            padding: 10px 16px;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .settings-btn-reset {
+            background: rgba(255, 255, 255, 0.1);
+            color: #fff;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .settings-btn-reset:hover {
+            background: rgba(255, 255, 255, 0.15);
+        }
+        
+        .settings-status {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            opacity: 0;
+            transform: translateY(20px);
+            transition: all 0.3s;
+            z-index: 1000;
+        }
+        
+        .settings-status.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+        
+        .settings-status.success {
+            background: rgba(0, 255, 136, 0.9);
+            color: #000;
+        }
+        
+        .settings-status.error {
+            background: rgba(255, 68, 102, 0.9);
+            color: #fff;
+        }
+        
         .instructions {
             background: var(--bg-secondary);
             border-radius: 12px;
@@ -507,7 +837,7 @@ HTML_PAGE = '''
 <body>
     <div class="container">
         <header>
-            <h1>📷 Sync Camera Setup</h1>
+            <h1>Sync Camera Setup</h1>
             <div class="camera-count"><span id="cam-count">0</span> cameras</div>
         </header>
         
@@ -523,15 +853,188 @@ HTML_PAGE = '''
             <ul>
                 <li><strong>1.</strong> Start the QR beacon: <code>./run_beacon.sh</code></li>
                 <li><strong>2.</strong> Point cameras at the QR display</li>
-                <li><strong>3.</strong> Adjust until all cameras show <strong>green</strong></li>
-                <li><strong>4.</strong> Verify timestamps are updating</li>
+                <li><strong>3.</strong> Adjust camera settings using the V4L2 controls</li>
+                <li><strong>4.</strong> Verify timestamps are updating (green indicator)</li>
                 <li><strong>5.</strong> Start recording when ready</li>
             </ul>
         </div>
     </div>
     
+    <div id="status" class="settings-status"></div>
+    
     <script>
         let cameras = {};
+        let cameraControls = {};
+        let applyTimers = {};
+        
+        function formatControlName(name) {
+            return name.replace(/_/g, ' ').replace(/\\b\\w/g, l => l.toUpperCase());
+        }
+        
+        function showStatus(message, type) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = `settings-status ${type} show`;
+            setTimeout(() => {
+                status.classList.remove('show');
+            }, 3000);
+        }
+        
+        async function loadControls(camId) {
+            const contentEl = document.getElementById(`controls-content-${camId}`);
+            if (!contentEl) return;
+            
+            contentEl.innerHTML = '<div class="settings-loading">Loading controls...</div>';
+            
+            try {
+                const resp = await fetch(`/api/controls/${camId}`);
+                const data = await resp.json();
+                
+                if (data.error) {
+                    contentEl.innerHTML = `<div class="settings-unavailable">${data.error}</div>`;
+                    return;
+                }
+                
+                if (Object.keys(data.controls).length === 0) {
+                    contentEl.innerHTML = '<div class="settings-unavailable">No V4L2 controls available for this camera</div>';
+                    return;
+                }
+                
+                cameraControls[camId] = data.controls;
+                renderControls(camId, data.controls);
+            } catch (e) {
+                contentEl.innerHTML = '<div class="settings-unavailable">Failed to load controls</div>';
+                console.error('Controls error:', e);
+            }
+        }
+        
+        function renderControls(camId, controls) {
+            const contentEl = document.getElementById(`controls-content-${camId}`);
+            if (!contentEl) return;
+            
+            let html = '';
+            
+            for (const [name, ctrl] of Object.entries(controls)) {
+                if (ctrl.type === 'int') {
+                    html += `
+                        <div class="control-group">
+                            <div class="control-label">
+                                <span class="control-name">${formatControlName(name)}</span>
+                                <span class="control-value" id="value-${camId}-${name}">${ctrl.value}</span>
+                            </div>
+                            <div class="slider-container">
+                                <span class="range-label">${ctrl.min}</span>
+                                <input type="range" 
+                                    id="ctrl-${camId}-${name}"
+                                    min="${ctrl.min}" 
+                                    max="${ctrl.max}" 
+                                    step="${ctrl.step || 1}"
+                                    value="${ctrl.value}"
+                                    data-camid="${camId}"
+                                    data-control="${name}"
+                                    oninput="updateSliderValue(this)">
+                                <span class="range-label max">${ctrl.max}</span>
+                            </div>
+                        </div>
+                    `;
+                } else if (ctrl.type === 'menu' || ctrl.type === 'bool') {
+                    const options = ctrl.options || {0: 'Off', 1: 'On'};
+                    html += `
+                        <div class="control-group">
+                            <div class="control-label">
+                                <span class="control-name">${formatControlName(name)}</span>
+                            </div>
+                            <select class="control-select" 
+                                id="ctrl-${camId}-${name}"
+                                data-camid="${camId}" 
+                                data-control="${name}"
+                                onchange="updateSelectValue(this)">
+                                ${Object.entries(options).map(([val, label]) => 
+                                    `<option value="${val}" ${ctrl.value == val ? 'selected' : ''}>${label}</option>`
+                                ).join('')}
+                            </select>
+                        </div>
+                    `;
+                }
+            }
+            
+            html += `
+                <div class="settings-btn-group">
+                    <button class="settings-btn settings-btn-reset" onclick="resetControls(${camId})">Reset to Defaults</button>
+                </div>
+            `;
+            
+            contentEl.innerHTML = html;
+        }
+        
+        function updateSliderValue(input) {
+            const valueSpan = document.getElementById(`value-${input.dataset.camid}-${input.dataset.control}`);
+            if (valueSpan) {
+                valueSpan.textContent = input.value;
+            }
+            applyControl(input.dataset.camid, input.dataset.control, input.value);
+        }
+        
+        function updateSelectValue(select) {
+            applyControl(select.dataset.camid, select.dataset.control, select.value);
+        }
+        
+        async function applyControl(camId, control, value) {
+            const key = `${camId}-${control}`;
+            if (applyTimers[key]) {
+                clearTimeout(applyTimers[key]);
+            }
+            
+            applyTimers[key] = setTimeout(async () => {
+                try {
+                    const resp = await fetch(`/api/set/${camId}`, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({control, value: parseInt(value)})
+                    });
+                    const result = await resp.json();
+                    
+                    if (!result.success) {
+                        showStatus('Error: ' + result.error, 'error');
+                    }
+                } catch (e) {
+                    showStatus('Failed to apply setting', 'error');
+                }
+            }, 50);
+        }
+        
+        async function resetControls(camId) {
+            try {
+                const resp = await fetch(`/api/reset/${camId}`, {
+                    method: 'POST'
+                });
+                const result = await resp.json();
+                
+                if (result.success) {
+                    showStatus('Reset to defaults!', 'success');
+                    loadControls(camId);
+                } else {
+                    showStatus('Error: ' + result.error, 'error');
+                }
+            } catch (e) {
+                showStatus('Failed to reset', 'error');
+            }
+        }
+        
+        function toggleSettings(camId) {
+            const toggle = document.getElementById(`settings-toggle-${camId}`);
+            const panel = document.getElementById(`settings-panel-${camId}`);
+            
+            if (toggle && panel) {
+                toggle.classList.toggle('open');
+                panel.classList.toggle('open');
+                
+                // Load controls if opening and not yet loaded
+                if (panel.classList.contains('open') && !cameraControls[camId]) {
+                    loadControls(camId);
+                }
+            }
+        }
         
         async function updateStatus() {
             try {
@@ -570,6 +1073,15 @@ HTML_PAGE = '''
                             </div>
                             <div class="frame-wrapper">
                                 <img id="img-${id}" src="/api/stream/${id}" alt="Camera ${id}">
+                            </div>
+                            <div class="settings-toggle" id="settings-toggle-${id}" onclick="toggleSettings(${id})">
+                                <span class="settings-toggle-text">V4L2 Camera Settings</span>
+                                <span class="settings-toggle-arrow">&#9660;</span>
+                            </div>
+                            <div class="settings-panel" id="settings-panel-${id}">
+                                <div class="settings-content" id="controls-content-${id}">
+                                    <div class="settings-loading">Click to load controls...</div>
+                                </div>
                             </div>`;
                         grid.appendChild(panel);
                     }
@@ -678,6 +1190,64 @@ async def stream(cam_id: int):
         generate(),
         media_type='multipart/x-mixed-replace; boundary=frame'
     )
+
+
+@app.get("/api/controls/{cam_id}")
+async def get_controls(cam_id: int):
+    """Get v4l2 controls for a camera."""
+    if not manager:
+        return JSONResponse(content={"error": "No cameras available"})
+    
+    if cam_id not in manager.cameras:
+        return JSONResponse(content={"error": "Camera not found"})
+    
+    cam = manager.cameras[cam_id]
+    
+    if sys.platform == 'darwin':
+        return JSONResponse(content={"error": "V4L2 controls not available on macOS"})
+    
+    controls = get_camera_controls(cam.path)
+    return JSONResponse(content={"controls": controls, "device": cam.path})
+
+
+@app.post("/api/set/{cam_id}")
+async def set_control(cam_id: int, request: Request):
+    """Set a v4l2 control for a camera."""
+    if not manager:
+        return JSONResponse(content={"success": False, "error": "No cameras available"})
+    
+    if cam_id not in manager.cameras:
+        return JSONResponse(content={"success": False, "error": "Camera not found"})
+    
+    cam = manager.cameras[cam_id]
+    
+    try:
+        request_data = await request.json()
+    except Exception:
+        return JSONResponse(content={"success": False, "error": "Invalid JSON body"})
+    
+    control = request_data.get('control')
+    value = request_data.get('value')
+    
+    if not control or value is None:
+        return JSONResponse(content={"success": False, "error": "Missing control or value"})
+    
+    success, error = set_camera_control(cam.path, control, value)
+    return JSONResponse(content={"success": success, "error": error})
+
+
+@app.post("/api/reset/{cam_id}")
+async def reset_controls(cam_id: int):
+    """Reset all v4l2 controls to defaults for a camera."""
+    if not manager:
+        return JSONResponse(content={"success": False, "error": "No cameras available"})
+    
+    if cam_id not in manager.cameras:
+        return JSONResponse(content={"success": False, "error": "Camera not found"})
+    
+    cam = manager.cameras[cam_id]
+    success, error = reset_camera_controls(cam.path)
+    return JSONResponse(content={"success": success, "error": error})
 
 
 def main():

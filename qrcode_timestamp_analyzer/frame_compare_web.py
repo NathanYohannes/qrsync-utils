@@ -537,81 +537,177 @@ class VideoFrameServer:
         timestamp = self.decode_qr(frame, fast_mode=fast_mode)
         return frame, timestamp, pts_us
     
-    def analyze_sync(self, sample_interval: int = 30, progress_callback=None, fast_mode: bool = True) -> dict:
+    def analyze_sync(self, sample_interval: int = 30, progress_callback=None, fast_mode: bool = True,
+                      reference_cam: int = 1) -> dict:
         """
-        Analyze sync across the entire video by sampling frames.
+        Analyze sync across all loaded cameras by sampling frames.
+        Records timestamps for ALL cameras and calculates offsets relative to reference camera.
         
         Args:
             sample_interval: Sample every N frames (default: 30 = 1 per second at 30fps)
             progress_callback: Optional callback(current, total) for progress updates
             fast_mode: If True, only use WeChat QR detector (faster). If False, try all detectors.
+            reference_cam: Reference camera for offset calculations (1-indexed, default: 1)
         
         Returns:
-            Dictionary with analysis results
+            Dictionary with analysis results for all cameras
         """
+        if reference_cam < 1 or reference_cam > self.num_cameras:
+            raise ValueError(f"reference_cam must be 1-{self.num_cameras}, got {reference_cam}")
+        
+        # Build camera info list
+        camera_names = [v['name'] for v in self.videos]
+        
         results = {
             'frames': [],
-            'qr_offsets': [],
-            'pts_offsets': [],
-            'sync_errors': [],
-            'qr_detections': {'cam1': 0, 'cam2': 0, 'both': 0},
+            'num_cameras': self.num_cameras,
+            'camera_names': camera_names,
+            'reference_cam': reference_cam,
+            # Per-camera data: qr_ts[cam_idx], pts[cam_idx]
+            'qr_timestamps': {i: [] for i in range(self.num_cameras)},  # 0-indexed
+            'pts_timestamps': {i: [] for i in range(self.num_cameras)},
+            # Offsets relative to reference camera (cam_idx -> reference)
+            'qr_offsets': {i: [] for i in range(self.num_cameras) if i != reference_cam - 1},
+            'pts_offsets': {i: [] for i in range(self.num_cameras) if i != reference_cam - 1},
+            'sync_errors': {i: [] for i in range(self.num_cameras) if i != reference_cam - 1},
+            # Detection counts per camera
+            'qr_detections': {i: 0 for i in range(self.num_cameras)},
             'sample_count': 0,
-            'video1_name': self.video1_name,
-            'video2_name': self.video2_name,
             'max_frames': self.max_frames,
             'fps': self.fps1,
             'sample_interval': sample_interval,
+            # Legacy compatibility
+            'video1_name': self.video1_name,
+            'video2_name': self.video2_name if self.num_cameras > 1 else None,
         }
         
         total_samples = self.max_frames // sample_interval
+        ref_idx = reference_cam - 1  # Convert to 0-indexed
         
         for i, frame_num in enumerate(range(0, self.max_frames, sample_interval)):
             if progress_callback:
                 progress_callback(i, total_samples)
             
-            # Get data for both cameras
-            frame1, ts1, pts1 = self.get_frame_raw(1, frame_num, fast_mode=fast_mode)
-            frame2, ts2, pts2 = self.get_frame_raw(2, frame_num, fast_mode=fast_mode)
+            # Get data for ALL cameras
+            cam_data = []  # [(frame, qr_ts, pts), ...]
+            all_valid = True
+            for cam_idx in range(self.num_cameras):
+                frame, ts, pts = self.get_frame_raw(cam_idx + 1, frame_num, fast_mode=fast_mode)
+                if frame is None:
+                    all_valid = False
+                    break
+                # Parse QR timestamp
+                qr_ts = None
+                if ts:
+                    try:
+                        qr_ts = int(ts)
+                    except (ValueError, TypeError):
+                        pass
+                cam_data.append((frame, qr_ts, pts))
             
-            if frame1 is None or frame2 is None:
+            if not all_valid:
                 continue
             
             results['sample_count'] += 1
             results['frames'].append(frame_num)
             
-            # Track QR detection success
-            if ts1:
-                results['qr_detections']['cam1'] += 1
-            if ts2:
-                results['qr_detections']['cam2'] += 1
-            if ts1 and ts2:
-                results['qr_detections']['both'] += 1
+            # Store timestamps for each camera
+            for cam_idx, (frame, qr_ts, pts) in enumerate(cam_data):
+                results['qr_timestamps'][cam_idx].append(qr_ts)
+                results['pts_timestamps'][cam_idx].append(pts)
+                
+                if qr_ts is not None:
+                    results['qr_detections'][cam_idx] += 1
             
-            # Calculate offsets
-            qr_offset = None
-            pts_offset = None
-            sync_error = None
+            # Calculate offsets relative to reference camera
+            ref_qr = cam_data[ref_idx][1]  # QR timestamp of reference
+            ref_pts = cam_data[ref_idx][2]  # PTS of reference
             
-            if ts1 and ts2:
-                try:
-                    qr_offset = (int(ts2) - int(ts1)) / 1000.0  # Convert us to ms
-                except ValueError:
-                    pass
-            
-            if pts1 and pts2:
-                pts_offset = (pts2 - pts1) / 1000.0  # Convert us to ms
-            
-            if qr_offset is not None and pts_offset is not None:
-                sync_error = pts_offset - qr_offset
-            
-            results['qr_offsets'].append(qr_offset)
-            results['pts_offsets'].append(pts_offset)
-            results['sync_errors'].append(sync_error)
+            for cam_idx in range(self.num_cameras):
+                if cam_idx == ref_idx:
+                    continue
+                
+                cam_qr = cam_data[cam_idx][1]
+                cam_pts = cam_data[cam_idx][2]
+                
+                # QR offset: cam - reference (in ms)
+                qr_offset = None
+                if cam_qr is not None and ref_qr is not None:
+                    qr_offset = (cam_qr - ref_qr) / 1000.0
+                
+                # PTS offset: cam - reference (in ms)
+                pts_offset = None
+                if cam_pts is not None and ref_pts is not None:
+                    pts_offset = (cam_pts - ref_pts) / 1000.0
+                
+                # Sync error
+                sync_error = None
+                if qr_offset is not None and pts_offset is not None:
+                    sync_error = pts_offset - qr_offset
+                
+                results['qr_offsets'][cam_idx].append(qr_offset)
+                results['pts_offsets'][cam_idx].append(pts_offset)
+                results['sync_errors'][cam_idx].append(sync_error)
         
         # Calculate statistics
-        results['statistics'] = self._calculate_statistics(results)
+        results['statistics'] = self._calculate_statistics_multi(results)
         
         return results
+    
+    def _calculate_statistics_multi(self, results: dict) -> dict:
+        """Calculate statistics for multi-camera analysis."""
+        import numpy as np
+        
+        stats = {
+            'per_camera': {},
+            'offsets': {},
+        }
+        
+        # Per-camera QR detection stats
+        for cam_idx in range(results['num_cameras']):
+            cam_name = results['camera_names'][cam_idx]
+            detections = results['qr_detections'][cam_idx]
+            total = results['sample_count']
+            stats['per_camera'][cam_name] = {
+                'qr_detections': detections,
+                'detection_rate': (detections / total * 100) if total > 0 else 0,
+            }
+        
+        # Offset statistics (relative to reference)
+        ref_idx = results['reference_cam'] - 1
+        ref_name = results['camera_names'][ref_idx]
+        
+        for cam_idx in range(results['num_cameras']):
+            if cam_idx == ref_idx:
+                continue
+            
+            cam_name = results['camera_names'][cam_idx]
+            key = f"{cam_name}_vs_{ref_name}"
+            
+            qr_offsets = [x for x in results['qr_offsets'][cam_idx] if x is not None]
+            pts_offsets = [x for x in results['pts_offsets'][cam_idx] if x is not None]
+            sync_errors = [x for x in results['sync_errors'][cam_idx] if x is not None]
+            
+            def calc_stats(data):
+                if not data:
+                    return None
+                arr = np.array(data)
+                return {
+                    'count': len(arr),
+                    'mean': float(np.mean(arr)),
+                    'std': float(np.std(arr)),
+                    'min': float(np.min(arr)),
+                    'max': float(np.max(arr)),
+                    'median': float(np.median(arr)),
+                }
+            
+            stats['offsets'][key] = {
+                'qr_offset': calc_stats(qr_offsets),
+                'pts_offset': calc_stats(pts_offsets),
+                'sync_error': calc_stats(sync_errors),
+            }
+        
+        return stats
     
     def analyze_sync_fast(self, sample_interval: int = 30, progress_callback=None, num_workers: int = None) -> dict:
         """
@@ -765,16 +861,112 @@ class VideoFrameServer:
         return stats
     
     def generate_sync_graph(self, results: dict) -> bytes:
-        """Generate a sync graph image from analysis results."""
+        """Generate a sync graph image from multi-camera analysis results."""
         if not MATPLOTLIB_AVAILABLE:
             return None
         
-        fig, axes = plt.subplots(3, 1, figsize=(14, 10), dpi=100)
-        fig.patch.set_facecolor('#0a0a0f')
+        # Check if this is multi-camera format (new) or 2-camera format (legacy)
+        is_multi_cam = isinstance(results.get('qr_offsets'), dict)
         
         frames = results['frames']
         time_seconds = [f / results['fps'] for f in frames]
         time_minutes = [t / 60 for t in time_seconds]
+        
+        if is_multi_cam:
+            return self._generate_multi_cam_graph(results, time_minutes)
+        else:
+            return self._generate_legacy_graph(results, time_minutes)
+    
+    def _generate_multi_cam_graph(self, results: dict, time_minutes: list) -> bytes:
+        """Generate graph for multi-camera results."""
+        num_cameras = results.get('num_cameras', 2)
+        camera_names = results.get('camera_names', [])
+        ref_idx = results.get('reference_cam', 1) - 1
+        ref_name = camera_names[ref_idx] if ref_idx < len(camera_names) else 'ref'
+        
+        # Get non-reference camera indices
+        other_cams = [i for i in range(num_cameras) if i != ref_idx]
+        num_plots = len(other_cams)
+        
+        # Colors for different cameras
+        cam_colors = ['#00ff88', '#ff6688', '#00aaff', '#ffaa00']
+        
+        fig, axes = plt.subplots(num_plots, 3, figsize=(18, 4 * num_plots), dpi=100)
+        fig.patch.set_facecolor('#0a0a0f')
+        
+        # Handle single row case
+        if num_plots == 1:
+            axes = [axes]
+        
+        for plot_idx, cam_idx in enumerate(other_cams):
+            cam_name = camera_names[cam_idx] if cam_idx < len(camera_names) else f'cam{cam_idx+1}'
+            cam_name_short = cam_name.replace('.mkv', '').replace('.mp4', '')
+            ref_name_short = ref_name.replace('.mkv', '').replace('.mp4', '')
+            color = cam_colors[plot_idx % len(cam_colors)]
+            
+            row_axes = axes[plot_idx]
+            
+            # Style all axes in this row
+            for ax in row_axes:
+                ax.set_facecolor('#12121a')
+                ax.tick_params(colors='#8888a0')
+                for spine in ax.spines.values():
+                    spine.set_color('#2a2a3a')
+                ax.xaxis.label.set_color('#e8e8ed')
+                ax.yaxis.label.set_color('#e8e8ed')
+                ax.title.set_color('#e8e8ed')
+            
+            # Get data for this camera
+            qr_offsets = results.get('qr_offsets', {}).get(cam_idx, [])
+            pts_offsets = results.get('pts_offsets', {}).get(cam_idx, [])
+            sync_errors = results.get('sync_errors', {}).get(cam_idx, [])
+            
+            # Plot 1: QR Offset
+            qr_data = [(t, v) for t, v in zip(time_minutes, qr_offsets) if v is not None]
+            if qr_data:
+                t_qr, v_qr = zip(*qr_data)
+                row_axes[0].plot(t_qr, v_qr, color=color, linewidth=1, alpha=0.8, label='QR Offset')
+                row_axes[0].axhline(y=0, color='#ffffff', linestyle='--', alpha=0.3)
+            row_axes[0].set_ylabel('QR Offset (ms)', fontsize=10)
+            row_axes[0].set_title(f'QR Offset: {cam_name_short} vs {ref_name_short}', fontsize=11, fontweight='bold')
+            row_axes[0].legend(loc='upper right', facecolor='#1a1a25', edgecolor='#2a2a3a', labelcolor='#e8e8ed')
+            row_axes[0].grid(True, alpha=0.2, color='#2a2a3a')
+            
+            # Plot 2: PTS Offset
+            pts_data = [(t, v) for t, v in zip(time_minutes, pts_offsets) if v is not None]
+            if pts_data:
+                t_pts, v_pts = zip(*pts_data)
+                row_axes[1].plot(t_pts, v_pts, color='#00aaff', linewidth=1, alpha=0.8, label='PTS Offset')
+                row_axes[1].axhline(y=0, color='#ffffff', linestyle='--', alpha=0.3)
+            row_axes[1].set_ylabel('PTS Offset (ms)', fontsize=10)
+            row_axes[1].set_title(f'PTS Offset: {cam_name_short} vs {ref_name_short}', fontsize=11, fontweight='bold')
+            row_axes[1].legend(loc='upper right', facecolor='#1a1a25', edgecolor='#2a2a3a', labelcolor='#e8e8ed')
+            row_axes[1].grid(True, alpha=0.2, color='#2a2a3a')
+            
+            # Plot 3: Sync Error
+            sync_data = [(t, v) for t, v in zip(time_minutes, sync_errors) if v is not None]
+            if sync_data:
+                t_sync, v_sync = zip(*sync_data)
+                colors = ['#00ff88' if abs(v) < 5 else '#ffaa00' if abs(v) < 50 else '#ff4466' for v in v_sync]
+                row_axes[2].scatter(t_sync, v_sync, c=colors, s=10, alpha=0.7)
+                row_axes[2].axhline(y=0, color='#ffffff', linestyle='--', alpha=0.3)
+            row_axes[2].set_xlabel('Time (minutes)', fontsize=10)
+            row_axes[2].set_ylabel('Sync Error (ms)', fontsize=10)
+            row_axes[2].set_title(f'Sync Error: {cam_name_short} vs {ref_name_short}', fontsize=11, fontweight='bold')
+            row_axes[2].grid(True, alpha=0.2, color='#2a2a3a')
+        
+        plt.tight_layout()
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', facecolor='#0a0a0f', edgecolor='none')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
+    
+    def _generate_legacy_graph(self, results: dict, time_minutes: list) -> bytes:
+        """Generate graph for legacy 2-camera results."""
+        fig, axes = plt.subplots(3, 1, figsize=(14, 10), dpi=100)
+        fig.patch.set_facecolor('#0a0a0f')
         
         # Style settings
         for ax in axes:
@@ -839,7 +1031,6 @@ class VideoFrameServer:
         
         plt.tight_layout()
         
-        # Save to bytes
         buf = io.BytesIO()
         plt.savefig(buf, format='png', facecolor='#0a0a0f', edgecolor='none')
         plt.close(fig)
@@ -2137,13 +2328,18 @@ VIEWER_HTML = '''
                     🎬 Generate Analysis Video
                 </button>
                 <div style="display: flex; align-items: center; gap: 10px;">
+                    <label style="color: var(--text-secondary); font-size: 0.85rem;">Reference cam:</label>
+                    <select id="reference-cam" style="font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; padding: 8px; border: 1px solid var(--border); background: var(--bg-tertiary); color: var(--text-primary); border-radius: 6px;">
+                    </select>
+                    <span id="cam-count" style="color: var(--text-secondary); font-size: 0.8rem;">(analyzing all cameras)</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
                     <label style="color: var(--text-secondary); font-size: 0.85rem;">Sample interval:</label>
                     <input type="number" id="sample-interval" value="30" min="1" max="1000" style="width: 80px; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; padding: 8px; border: 1px solid var(--border); background: var(--bg-tertiary); color: var(--text-primary); border-radius: 6px;">
                 </div>
                 <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text-secondary); font-size: 0.85rem;">
                     <input type="checkbox" id="fast-mode" checked style="width: 18px; height: 18px; accent-color: var(--accent);">
                     <span>⚡ Fast mode</span>
-                    <span style="font-size: 0.75rem; color: var(--text-secondary);">(multiprocessing)</span>
                 </label>
             </div>
             
@@ -2245,6 +2441,22 @@ VIEWER_HTML = '''
                 }
                 if (info.videos && info.videos.length > 3) {
                     document.getElementById('video4-name').textContent = info.videos[3].name;
+                }
+                
+                // Populate reference camera dropdown
+                const refCamSelect = document.getElementById('reference-cam');
+                const camCountSpan = document.getElementById('cam-count');
+                refCamSelect.innerHTML = '';
+                if (info.videos) {
+                    info.videos.forEach((v, idx) => {
+                        const opt = document.createElement('option');
+                        opt.value = idx + 1;
+                        opt.textContent = `Cam${idx + 1}: ${v.name}`;
+                        refCamSelect.appendChild(opt);
+                    });
+                    // Default to first camera as reference
+                    refCamSelect.value = '1';
+                    camCountSpan.textContent = `(analyzing ${info.videos.length} cameras)`;
                 }
                 
                 document.getElementById('max-frames').textContent = maxFrames.toLocaleString();
@@ -2399,6 +2611,7 @@ VIEWER_HTML = '''
         async function runAnalysis() {
             const sampleInterval = parseInt(document.getElementById('sample-interval').value) || 30;
             const fastMode = document.getElementById('fast-mode').checked;
+            const referenceCam = document.getElementById('reference-cam').value;
             const statusDiv = document.getElementById('analysis-status');
             const progressBar = document.getElementById('analysis-progress');
             const percentText = document.getElementById('analysis-percent');
@@ -2408,7 +2621,7 @@ VIEWER_HTML = '''
             
             btn.disabled = true;
             videoBtn.disabled = true;
-            btn.textContent = fastMode ? '⚡ Fast Analyzing...' : '⏳ Analyzing...';
+            btn.textContent = '⏳ Analyzing all cameras...';
             statusDiv.style.display = 'block';
             resultsDiv.style.display = 'none';
             progressBar.style.width = '0%';
@@ -2416,8 +2629,8 @@ VIEWER_HTML = '''
             percentText.textContent = '0%';
             
             try {
-                // Start analysis in background
-                const startResp = await fetch(`/api/analyze/start?sample_interval=${sampleInterval}&fast=${fastMode}`, { method: 'POST' });
+                // Start multi-camera analysis with selected reference
+                const startResp = await fetch(`/api/analyze/start?sample_interval=${sampleInterval}&fast=${fastMode}&reference_cam=${referenceCam}`, { method: 'POST' });
                 if (!startResp.ok) {
                     const err = await startResp.json();
                     throw new Error(err.detail || 'Failed to start analysis');
@@ -2649,81 +2862,101 @@ analysis_state = {
 
 
 def save_analysis_results(results: dict, output_dir: Path):
-    """Save analysis results to CSV and JSON files."""
+    """Save multi-camera analysis results to CSV and JSON files."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Save CSV with all data points
-    csv_path = output_dir / f"sync_analysis_{timestamp}.csv"
+    num_cameras = results.get('num_cameras', 2)
+    camera_names = results.get('camera_names', ['cam1', 'cam2'])
+    ref_idx = results.get('reference_cam', 1) - 1
+    
+    # Clean camera names for filenames
+    clean_names = [n.replace('.mkv', '').replace('.mp4', '').replace('.avi', '') for n in camera_names]
+    filename_suffix = '_'.join(clean_names[:3])  # Use first 3 names max to avoid too-long filenames
+    
+    # Save CSV with all data points for all cameras
+    csv_path = output_dir / f"sync_analysis_{filename_suffix}_{timestamp}.csv"
     try:
-        lines = ["frame,time_seconds,time_minutes,qr_offset_ms,pts_offset_ms,sync_error_ms"]
-        fps = results.get('fps', 30)
+        # Build dynamic header
+        header_parts = ['frame', 'time_seconds', 'time_minutes']
         
+        # Add QR timestamp column for each camera
+        for i, name in enumerate(clean_names):
+            header_parts.append(f'qr_ts_{name}_us')
+        
+        # Add PTS column for each camera
+        for i, name in enumerate(clean_names):
+            header_parts.append(f'pts_{name}_us')
+        
+        # Add offset columns (each camera vs reference)
+        ref_name = clean_names[ref_idx]
+        for i, name in enumerate(clean_names):
+            if i != ref_idx:
+                header_parts.append(f'qr_offset_{name}_vs_{ref_name}_ms')
+                header_parts.append(f'pts_offset_{name}_vs_{ref_name}_ms')
+                header_parts.append(f'sync_error_{name}_vs_{ref_name}_ms')
+        
+        lines = [','.join(header_parts)]
+        fps = results.get('fps', 30)
         frames = results.get('frames', [])
-        qr_offsets = results.get('qr_offsets', [])
-        pts_offsets = results.get('pts_offsets', [])
-        sync_errors = results.get('sync_errors', [])
         
         for i, frame in enumerate(frames):
             time_sec = frame / fps
             time_min = time_sec / 60
-            qr_off = qr_offsets[i] if i < len(qr_offsets) and qr_offsets[i] is not None else ''
-            pts_off = pts_offsets[i] if i < len(pts_offsets) and pts_offsets[i] is not None else ''
-            sync_err = sync_errors[i] if i < len(sync_errors) and sync_errors[i] is not None else ''
+            row = [str(frame), f'{time_sec:.3f}', f'{time_min:.4f}']
             
-            if qr_off != '':
-                qr_off = f"{qr_off:.3f}"
-            if pts_off != '':
-                pts_off = f"{pts_off:.3f}"
-            if sync_err != '':
-                sync_err = f"{sync_err:.3f}"
+            # Add QR timestamps for each camera
+            for cam_idx in range(num_cameras):
+                qr_ts_list = results.get('qr_timestamps', {}).get(cam_idx, [])
+                val = qr_ts_list[i] if i < len(qr_ts_list) and qr_ts_list[i] is not None else ''
+                row.append(str(val) if val != '' else '')
             
-            lines.append(f"{frame},{time_sec:.3f},{time_min:.4f},{qr_off},{pts_off},{sync_err}")
+            # Add PTS for each camera
+            for cam_idx in range(num_cameras):
+                pts_list = results.get('pts_timestamps', {}).get(cam_idx, [])
+                val = pts_list[i] if i < len(pts_list) and pts_list[i] is not None else ''
+                row.append(str(val) if val != '' else '')
+            
+            # Add offsets (each camera vs reference)
+            for cam_idx in range(num_cameras):
+                if cam_idx == ref_idx:
+                    continue
+                
+                qr_off_list = results.get('qr_offsets', {}).get(cam_idx, [])
+                pts_off_list = results.get('pts_offsets', {}).get(cam_idx, [])
+                sync_err_list = results.get('sync_errors', {}).get(cam_idx, [])
+                
+                qr_off = qr_off_list[i] if i < len(qr_off_list) and qr_off_list[i] is not None else ''
+                pts_off = pts_off_list[i] if i < len(pts_off_list) and pts_off_list[i] is not None else ''
+                sync_err = sync_err_list[i] if i < len(sync_err_list) and sync_err_list[i] is not None else ''
+                
+                row.append(f'{qr_off:.3f}' if qr_off != '' else '')
+                row.append(f'{pts_off:.3f}' if pts_off != '' else '')
+                row.append(f'{sync_err:.3f}' if sync_err != '' else '')
+            
+            lines.append(','.join(row))
         
         with open(csv_path, 'w') as f:
             f.write('\n'.join(lines))
         print(f"Saved analysis CSV: {csv_path}")
     except Exception as e:
         print(f"Error saving CSV: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Save JSON with statistics
-    json_path = output_dir / f"sync_analysis_{timestamp}.json"
+    json_path = output_dir / f"sync_analysis_{filename_suffix}_{timestamp}.json"
     try:
-        import numpy as np
-        
-        # Calculate statistics
-        qr_offsets_valid = [x for x in results.get('qr_offsets', []) if x is not None]
-        pts_offsets_valid = [x for x in results.get('pts_offsets', []) if x is not None]
-        sync_errors_valid = [x for x in results.get('sync_errors', []) if x is not None]
-        
-        def calc_stats(data):
-            if not data:
-                return None
-            arr = np.array(data)
-            return {
-                'count': len(arr),
-                'mean': float(np.mean(arr)),
-                'std': float(np.std(arr)),
-                'min': float(np.min(arr)),
-                'max': float(np.max(arr)),
-                'median': float(np.median(arr)),
-                'p5': float(np.percentile(arr, 5)),
-                'p95': float(np.percentile(arr, 95)),
-            }
-        
         stats = {
             'timestamp': timestamp,
-            'video1_name': results.get('video1_name'),
-            'video2_name': results.get('video2_name'),
+            'num_cameras': num_cameras,
+            'camera_names': camera_names,
+            'reference_camera': camera_names[ref_idx],
             'sample_count': results.get('sample_count', 0),
             'sample_interval': results.get('sample_interval'),
             'max_frames': results.get('max_frames'),
             'fps': results.get('fps'),
-            'qr_detections': results.get('qr_detections', {}),
-            'statistics': {
-                'qr_offsets': calc_stats(qr_offsets_valid),
-                'pts_offsets': calc_stats(pts_offsets_valid),
-                'sync_errors': calc_stats(sync_errors_valid),
-            }
+            'qr_detections': {camera_names[k]: v for k, v in results.get('qr_detections', {}).items()},
+            'statistics': results.get('statistics', {}),
         }
         
         with open(json_path, 'w') as f:
@@ -2735,20 +2968,20 @@ def save_analysis_results(results: dict, output_dir: Path):
     return csv_path, json_path
 
 
-def run_analysis_thread(sample_interval: int, fast_mode: bool = True):
-    """Run analysis in background thread."""
+def run_analysis_thread(sample_interval: int, fast_mode: bool = True, reference_cam: int = 1):
+    """Run multi-camera analysis in background thread."""
     global analysis_state
     
     def progress_cb(current, total):
         analysis_state['progress'] = current
         analysis_state['total'] = total
         pct = int((current / total) * 100) if total > 0 else 0
-        analysis_state['status'] = f'Analyzing... {pct}% ({current:,} / {total:,} samples)'
+        analysis_state['status'] = f'Analyzing {viewer.num_cameras} cameras... {pct}% ({current:,} / {total:,} samples)'
     
     try:
-        # Always use sequential analysis - threading causes OpenCV WeChat detector crashes
-        # fast_mode now just controls whether to skip fallback QR detectors
-        results = viewer.analyze_sync(sample_interval=sample_interval, progress_callback=progress_cb, fast_mode=fast_mode)
+        # Analyze all cameras with reference_cam as the reference
+        results = viewer.analyze_sync(sample_interval=sample_interval, progress_callback=progress_cb, 
+                                       fast_mode=fast_mode, reference_cam=reference_cam)
         
         analysis_state['results'] = results
         analysis_state['status'] = 'Saving results...'
@@ -2805,12 +3038,15 @@ def run_video_thread(sample_interval: int, max_frames: int, output_fps: float = 
 
 
 @app.post("/api/analyze/start")
-async def start_analysis(sample_interval: int = 30, fast: bool = True):
-    """Start sync analysis in background.
+async def start_analysis(sample_interval: int = 30, fast: bool = True, reference_cam: int = 1):
+    """Start multi-camera sync analysis in background.
+    
+    Analyzes ALL loaded cameras and calculates offsets relative to the reference camera.
     
     Args:
         sample_interval: Sample every N frames (default: 30)
-        fast: Use fast parallel mode (default: True) - uses multiprocessing + WeChat-only QR
+        fast: Use fast mode (default: True) - uses WeChat-only QR detector
+        reference_cam: Reference camera for offset calculations (1-indexed, default: 1)
     """
     global analysis_state
     
@@ -2820,17 +3056,21 @@ async def start_analysis(sample_interval: int = 30, fast: bool = True):
     if analysis_state['running']:
         raise HTTPException(status_code=409, detail="Operation already in progress")
     
-    num_workers = min(mp.cpu_count(), 8) if fast else 1
+    if reference_cam < 1 or reference_cam > viewer.num_cameras:
+        raise HTTPException(status_code=400, detail=f"reference_cam must be 1-{viewer.num_cameras}")
+    
+    camera_names = [v['name'] for v in viewer.videos]
+    ref_name = camera_names[reference_cam - 1]
     
     analysis_state['running'] = True
     analysis_state['progress'] = 0
     analysis_state['total'] = viewer.max_frames // sample_interval
-    analysis_state['status'] = f'Starting {"fast " if fast else ""}analysis with {num_workers} workers...'
+    analysis_state['status'] = f'Starting analysis of {viewer.num_cameras} cameras (ref: {ref_name})...'
     analysis_state['operation'] = 'analyze'
     analysis_state['error'] = None
     
     # Start in background thread
-    thread = threading.Thread(target=run_analysis_thread, args=(sample_interval, fast))
+    thread = threading.Thread(target=run_analysis_thread, args=(sample_interval, fast, reference_cam))
     thread.daemon = True
     thread.start()
     
@@ -2838,7 +3078,10 @@ async def start_analysis(sample_interval: int = 30, fast: bool = True):
         'status': 'started', 
         'total_samples': analysis_state['total'],
         'fast_mode': fast,
-        'num_workers': num_workers
+        'num_cameras': viewer.num_cameras,
+        'camera_names': camera_names,
+        'reference_cam': reference_cam,
+        'reference_name': ref_name,
     })
 
 
